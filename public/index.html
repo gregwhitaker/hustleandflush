@@ -1,0 +1,353 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Hustle and Flush — Pixel Art Prototype</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    html, body { background:#0d0f11; margin:0; height:100%; color:#e6e6e6; font-family: system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, Noto Sans, "Apple Color Emoji", "Segoe UI Emoji"; }
+    .wrap { display:flex; flex-direction:column; align-items:center; gap:12px; padding:16px; }
+    /* Larger display size with crisp pixels */
+    canvas { image-rendering: pixelated; image-rendering: crisp-edges; border:4px solid #242a2f; box-shadow: 0 0 0 2px #121417, 0 8px 30px rgba(0,0,0,.4); background:#10141a; width:960px; height:540px; }
+    .hud { display:flex; gap:16px; flex-wrap:wrap; align-items:center; justify-content:center; }
+    .pill { background:#161b21; border:1px solid #2a323a; padding:6px 10px; border-radius:9px; font-size:14px; }
+    .btn { cursor:pointer; user-select:none; }
+    .title { font-weight:700; letter-spacing:.5px; }
+    .kbd { border:1px solid #2a323a; padding:1px 6px; border-radius:4px; background:#0f1318; font-weight:700; }
+    .small { opacity:.8; font-size:12px; }
+    a { color:#8ecbff; text-decoration:none; }
+    a:hover { text-decoration:underline; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <div class="hud">
+    <div class="pill title">Hustle and Flush — Bathroom Attendant</div>
+    <div class="pill">Tips: $<span id="tips">0</span></div>
+    <div class="pill">Night: <span id="night">1</span></div>
+    <div class="pill">Time: <span id="time">60</span>s</div>
+    <div class="pill">Cleanliness: <span id="clean">100</span></div>
+    <div class="pill">Supplies — Towels:<span id="towel">8</span> Gum:<span id="gum">6</span> Spray:<span id="spray">5</span></div>
+  </div>
+  <!-- Internal pixel resolution 640x360 -->
+  <canvas id="game" width="640" height="360"></canvas>
+  <div class="hud small">
+    <div class="pill">Actions: <span class="kbd">1</span> Towel · <span class="kbd">2</span> Spray · <span class="kbd">3</span> Gum · <span class="kbd">Space</span> Clean · <span class="kbd">R</span> Restock (between nights)</div>
+    <div class="pill">Click a patron to serve their request. Keep it clean for better tips!</div>
+  </div>
+</div>
+<script>
+(function(){
+  // --- Game constants ---
+  const W = 640, H = 360; // play area
+  const SERVICE_X = 48;            // counter position
+  const QUEUE_GAP = 14;            // spacing between queued patrons
+  const BASE_SPEED = -90;          // px/sec when walking
+  const LEAVE_SPEED = -140;        // px/sec when storming out
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const UI = {
+    tips: document.getElementById('tips'),
+    night: document.getElementById('night'),
+    time: document.getElementById('time'),
+    clean: document.getElementById('clean'),
+    towel: document.getElementById('towel'),
+    gum: document.getElementById('gum'),
+    spray: document.getElementById('spray')
+  };
+
+  const rnd = (min,max)=>Math.random()*(max-min)+min;
+  const rndi = (min,max)=>Math.floor(rnd(min,max+1));
+
+  const COLORS = {
+    wall: '#1a2030', stall: '#0f1522', tile:'#151a26',
+    sink:'#2e3547', metal:'#7a8ba3', neon:'#f06dd4', neon2:'#50e3c2',
+    attendant:'#e0d4a5', attendantHat:'#c77dff',
+    patron:'#d2edf7', patron2:'#ffe6a7', patron3:'#ffd0d0',
+    mess:'#5c623a', tip:'gold', uiGreen:'#8ef0a6', danger:'#ff6b6b'
+  };
+
+  // --- Game State ---
+  const state = {
+    night: 1,
+    timeLeft: 60,
+    tips: 0,
+    cleanliness: 100,
+    action: 'towel', // 'towel'|'spray'|'gum'|'clean'
+    supplies: { towel: 8, gum: 6, spray: 5 },
+    patrons: [],
+    particles: [],
+    inNight: true,
+  };
+
+  // --- Queue helpers ---
+  function reindexQueue(){
+    const q = state.patrons.filter(p=>!p.leaving).sort((a,b)=>a.x-b.x); // leftmost first
+    for(let i=0;i<q.length;i++){
+      const p = q[i];
+      p.queueIndex = i;
+      p.targetX = SERVICE_X + i*QUEUE_GAP;
+      if(p.x > p.targetX){ p.vx = BASE_SPEED; } else { p.x = p.targetX; p.vx = 0; }
+    }
+  }
+
+  // --- Entities ---
+  function makePatron(){
+    const skins = [COLORS.patron, COLORS.patron2, COLORS.patron3];
+    const need = ['towel','spray','gum'][rndi(0,2)];
+    const startX = W + rndi(10,60);
+    // initial patience:
+    const travelTime = (startX - SERVICE_X) / Math.abs(BASE_SPEED);
+    const patience = travelTime + rnd(10,16);
+    return {
+      x: startX, y: 240 + rndi(-1,1), w: 10, h: 14,
+      vx: BASE_SPEED,
+      color: skins[rndi(0,skins.length-1)],
+      patience,
+      maxPatience: patience,
+      need,
+      leaving: false,
+      queueIndex: Infinity,
+      targetX: SERVICE_X
+    };
+  }
+
+  function spawnPatronWave(){
+    const count = rndi(1, 2 + Math.min(4, state.night));
+    for(let i=0;i<count;i++) state.patrons.push(makePatron());
+  }
+
+  // --- Input ---
+  let mouse = {x:0,y:0, clicked:false};
+  canvas.addEventListener('mousemove', e=>{
+    const rect = canvas.getBoundingClientRect();
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    mouse.x = (e.clientX - rect.left) * scaleX;
+    mouse.y = (e.clientY - rect.top) * scaleY;
+  });
+  canvas.addEventListener('mousedown', ()=> mouse.clicked = true);
+  window.addEventListener('mouseup', ()=> mouse.clicked = false);
+
+  window.addEventListener('keydown', (e)=>{
+    if(e.code==='Digit1') state.action='towel';
+    else if(e.code==='Digit2') state.action='spray';
+    else if(e.code==='Digit3') state.action='gum';
+    else if(e.code==='Space') state.action='clean';
+    else if(e.code==='KeyR' && !state.inNight) restock();
+  });
+
+  function restock(){
+    const budget = Math.floor(state.tips * 0.1);
+    const prices = {towel:1, gum:1, spray:2};
+    let spent = 0;
+    while(spent < budget){
+      const pick = ['towel','gum','spray'][rndi(0,2)];
+      if(spent + prices[pick] > budget) break;
+      state.supplies[pick] += 1;
+      spent += prices[pick];
+    }
+    state.tips -= spent;
+  }
+
+  // --- Update Loop ---
+  let last = 0, acc = 0; const dt = 1/60;
+
+  function update(sec){
+    if(state.inNight){
+      state.timeLeft -= sec;
+      if(state.timeLeft <= 0){ state.inNight = false; state.timeLeft = 0; }
+    }
+
+    // Random spawns during night
+    if(state.inNight && Math.random() < (0.012 + state.night*0.002)){
+      spawnPatronWave();
+    }
+
+    // Update patrons
+    for(let i=state.patrons.length-1;i>=0;i--){
+      const p = state.patrons[i];
+
+      // move toward target / exit
+      p.x += p.vx * sec;
+
+      // Once at/left of target, clamp to target & stop (only if not leaving)
+      if(!p.leaving && p.x <= p.targetX){ p.x = p.targetX; p.vx = 0; }
+
+      // patience
+      p.patience -= sec;
+
+      // mess chance
+      if(Math.random() < 0.2 * sec){ // slight global mess chance; keep it lively
+        state.cleanliness = Math.max(0, state.cleanliness - 1);
+        particle(p.x, p.y+10, COLORS.mess);
+      }
+
+      // out of patience => leave ignoring the queue
+      if(p.patience <= 0 && !p.leaving){ p.leaving = true; p.vx = LEAVE_SPEED; }
+
+      // remove after leaving off-screen
+      if(p.leaving && p.x < -20){ state.patrons.splice(i,1); }
+    }
+
+    // Re-pack queue every frame so spacing is consistent
+    reindexQueue();
+
+    // cleaning
+    if(state.action==='clean' && state.inNight){
+      state.cleanliness = Math.min(100, state.cleanliness + 20*sec);
+    }
+
+    // click interactions
+    if(mouse.clicked){ handleClick(mouse.x, mouse.y); mouse.clicked = false; }
+
+    // particles
+    for(let i=state.particles.length-1;i>=0;i--){
+      const q = state.particles[i];
+      q.vy += 12*sec; q.x += q.vx; q.y += q.vy; q.t -= sec;
+      if(q.t<=0) state.particles.splice(i,1);
+    }
+
+    // night end
+    if(!state.inNight && state.patrons.length===0){
+      state._nextTimer = (state._nextTimer || 2) - sec;
+      if(state._nextTimer <= 0){ state._nextTimer = null; nextNight(); }
+    }
+
+    // UI sync
+    UI.tips.textContent = state.tips.toFixed(0);
+    UI.night.textContent = state.night;
+    UI.time.textContent = Math.ceil(state.timeLeft);
+    UI.clean.textContent = Math.floor(state.cleanliness);
+    UI.towel.textContent = state.supplies.towel;
+    UI.gum.textContent = state.supplies.gum;
+    UI.spray.textContent = state.supplies.spray;
+  }
+
+  function nextNight(){
+    state.night++; state.timeLeft = Math.max(40, 60 - state.night*2); state.inNight = true;
+    state.supplies.towel += 3; state.supplies.gum += 2; state.supplies.spray += 1;
+  }
+
+  function handleClick(x,y){
+    if(!state.inNight) return;
+    for(let i=state.patrons.length-1;i>=0;i--){
+      const p = state.patrons[i];
+      if(x>p.x-6 && x<p.x+p.w+6 && y>p.y-2 && y<p.y+p.h+2){
+        if(state.action==='clean'){ state.cleanliness = Math.min(100, state.cleanliness + 5); return; }
+        if(['towel','spray','gum'].includes(state.action)){
+          if(p.vx!==0 && !p.leaving){ floatText('Wait!', p.x+4, p.y-6, '#ffcf66'); return; }
+          if(state.supplies[state.action] > 0){
+            state.supplies[state.action]--;
+            const speedBonus = Math.max(0, Math.min(1, (p.patience / p.maxPatience)));
+            const cleanBonus = state.cleanliness/100;
+            const tip = Math.max(1, Math.round(rndi(2,10) * (0.7 + speedBonus*0.5) * (0.6 + cleanBonus*0.6)));
+            state.tips += tip;
+            floatText(`+$${tip}`, p.x+4, p.y-6, COLORS.tip);
+            sparkle(p.x+4,p.y+2);
+            state.patrons.splice(i,1);
+            reindexQueue();
+          } else {
+            floatText('OUT!', p.x+4, p.y-6, COLORS.danger);
+          }
+        }
+        return;
+      }
+    }
+  }
+
+  function floatText(text,x,y,color){ state.particles.push({text,x,y, color, t:1.0, vx:0, vy:-0.2}); }
+  function particle(x,y,color){ state.particles.push({x,y, w:2,h:2, color, t:0.6, vx:rnd(-0.3,0.3), vy:rnd(-0.8,-0.2)}); }
+  function sparkle(x,y){ for(let i=0;i<6;i++) particle(x,y,COLORS.uiGreen); }
+
+  // --- Render ---
+  function draw(){
+    ctx.fillStyle = COLORS.wall; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle = COLORS.neon; ctx.fillRect(6,6,70,8);
+    ctx.fillStyle = COLORS.neon2; ctx.fillRect(8,8,66,2);
+
+    for(let i=0;i<5;i++){
+      const sx = 24 + i*60;
+      ctx.fillStyle = COLORS.stall; ctx.fillRect(sx, 80, 48, 58);
+      ctx.fillStyle = COLORS.metal; ctx.fillRect(sx, 80, 48, 2);
+    }
+
+    for(let y=180;y<H;y+=8){
+      for(let x=0;x<W;x+=8){
+        ctx.fillStyle = ((x>>3)^(y>>3)) & 1 ? COLORS.tile : '#121723';
+        ctx.fillRect(x,y,8,8);
+      }
+    }
+
+    ctx.fillStyle = COLORS.sink; ctx.fillRect(W-120, 96, 90, 18);
+    ctx.fillStyle = COLORS.metal; ctx.fillRect(W-120, 114, 90, 2);
+
+    drawAttendant(12, 238);
+    state.patrons.forEach(p=> drawPatron(p));
+    drawCursor();
+
+    state.particles.forEach(pt=>{
+      if(pt.text){ ctx.globalAlpha = Math.max(0, pt.t); ctx.fillStyle = pt.color; ctx.font = '8px monospace'; ctx.fillText(pt.text, pt.x, pt.y); ctx.globalAlpha = 1; }
+      else { ctx.globalAlpha = Math.max(0, pt.t); ctx.fillStyle = pt.color; ctx.fillRect(pt.x, pt.y, pt.w, pt.h); ctx.globalAlpha = 1; }
+    });
+
+    if(!state.inNight){ ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(0,0,W,H); drawPanel(); }
+
+    const barW = 120, barX = W-130, barY = 6;
+    ctx.fillStyle = '#263041'; ctx.fillRect(barX, barY, barW, 6);
+    ctx.fillStyle = '#3fd47b'; ctx.fillRect(barX, barY, Math.floor(barW*(state.cleanliness/100)), 6);
+    ctx.strokeStyle = '#111'; ctx.strokeRect(barX, barY, barW, 6);
+  }
+
+  function drawPanel(){
+    const text = `Night ${state.night} over\nTips: $${state.tips.toFixed(0)}\nPress R to Restock\nNext night begins automatically`;
+    const w = 200, h = 84, x = (W-w)/2, y=(H-h)/2;
+    ctx.fillStyle = '#121821'; ctx.fillRect(x,y,w,h);
+    ctx.strokeStyle = '#334'; ctx.strokeRect(x,y,w,h);
+    ctx.fillStyle = '#cde'; ctx.font = '10px monospace';
+    text.split('\n').forEach((line,i)=> ctx.fillText(line, x+8, y+18+i*16));
+  }
+
+  function drawPatron(p){
+    ctx.fillStyle = p.color; ctx.fillRect(p.x, p.y, p.w, p.h);
+    ctx.fillRect(p.x+2, p.y-4, 6, 4);
+    ctx.fillStyle = '#0e0e12'; ctx.fillRect(p.x-1, p.y-12, 12, 7);
+    ctx.strokeStyle = '#222'; ctx.strokeRect(p.x-1, p.y-12, 12, 7);
+    ctx.fillStyle = '#cfe';
+    const icon = p.need==='towel' ? 'T' : p.need==='spray' ? 'S' : 'G';
+    ctx.font = '6px monospace'; ctx.fillText(icon, p.x+3, p.y-7);
+
+    ctx.fillStyle = '#333'; ctx.fillRect(p.x, p.y-2, p.w, 2);
+    ctx.fillStyle = '#7cf9a2';
+    const frac = Math.max(0, Math.min(1, p.patience / p.maxPatience));
+    ctx.fillRect(p.x, p.y-2, Math.floor(p.w*frac), 2);
+  }
+
+  function drawAttendant(x,y){
+    ctx.fillStyle = COLORS.attendant; ctx.fillRect(x, y, 11, 15);
+    ctx.fillRect(x+3, y-4, 5, 4);
+    ctx.fillStyle = COLORS.attendantHat; ctx.fillRect(x+2, y-6, 7, 2);
+    ctx.fillStyle = '#181e28'; ctx.fillRect(x+16, y-6, 56, 14);
+    ctx.strokeStyle = '#2b3340'; ctx.strokeRect(x+16, y-6, 56, 14);
+  }
+
+  function drawCursor(){
+    const x = mouse.x, y = mouse.y;
+    let glyph = '?';
+    if(state.action==='towel') glyph='T';
+    else if(state.action==='spray') glyph='S';
+    else if(state.action==='gum') glyph='G';
+    else if(state.action==='clean') glyph='C';
+    ctx.fillStyle = 'rgba(255,255,255,.07)'; ctx.fillRect(x-3,y-3,6,6);
+    ctx.fillStyle = '#dde'; ctx.font='8px monospace'; ctx.fillText(glyph, x+6, y-6);
+  }
+
+  // --- Main loop ---
+  function frame(t){ if(!last) last=t; const delta=(t-last)/1000; last=t; acc += delta; while(acc > dt){ update(dt); acc -= dt; } draw(); requestAnimationFrame(frame); }
+
+  // Kickoff
+  state.timeLeft = 60; spawnPatronWave(); requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
